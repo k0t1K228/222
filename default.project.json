@@ -1,0 +1,26 @@
+{
+  "name": "RobloxSkibidi",
+  "tree": {
+    "$className": "DataModel",
+
+    "ReplicatedStorage": {
+      "Classes": {
+        "$path": "src/shared/Classes"
+      }
+    },
+
+    "ServerScriptService": {
+      "Server": {
+        "$path": "src/server"
+      }
+    },
+
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Client": {
+          "$path": "src/client"
+        }
+      }
+    }
+  }
+}

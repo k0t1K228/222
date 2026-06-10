@@ -1,0 +1,92 @@
+-- ============================================
+-- НАСТРОЙКИ (меняй только здесь)
+-- ============================================
+local CONFIG = {
+	speed = 0.10,        -- скорость (0.05 = медленно, 0.15 = быстро)
+	rotateSpeed = 0.1,   -- плавность поворота
+	spawnHeight = 1,     -- высота спавна
+	waypointReach = 1.5, -- дистанция до точки чтобы считалась достигнутой
+}
+-- ============================================
+
+local RunService = game:GetService("RunService")
+
+local waypointsFolder = workspace:WaitForChild("WaypointsFolder")
+local waypoints = waypointsFolder:GetChildren()
+
+table.sort(waypoints, function(a, b)
+	return tonumber(a.Name:match("%d+")) < tonumber(b.Name:match("%d+"))
+end)
+
+for _, waypoint in ipairs(waypoints) do
+	waypoint.CanCollide = false
+	waypoint.Anchored = true
+	waypoint.Transparency = 1
+end
+
+local function moveEnemy(enemy)
+	local rootPart = enemy.PrimaryPart
+
+	-- Отключаем физику
+	for _, part in ipairs(enemy:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.CanCollide = false
+			part.Anchored = true
+		end
+	end
+
+	for _, waypoint in ipairs(waypoints) do
+		local targetPos = Vector3.new(
+			waypoint.Position.X,
+			rootPart.Position.Y,
+			waypoint.Position.Z
+		)
+
+		-- Идём к точке через Lerp (плавно)
+		while (rootPart.Position - targetPos).Magnitude > CONFIG.waypointReach do
+			local currentCFrame = enemy:GetPrimaryPartCFrame()
+			local direction = (targetPos - rootPart.Position).Unit
+
+			-- Плавный поворот
+			local targetCFrame = CFrame.new(rootPart.Position, targetPos)
+			local smoothCFrame = currentCFrame:Lerp(targetCFrame, CONFIG.rotateSpeed)
+
+			-- Двигаем модель целиком
+			local newPos = rootPart.Position + direction * CONFIG.speed * 60 * task.wait()
+			enemy:SetPrimaryPartCFrame(
+				CFrame.new(newPos) * (smoothCFrame - smoothCFrame.Position)
+			)
+		end
+	end
+
+	print("Враг дошёл до базы!")
+	enemy:Destroy()
+end
+
+local function spawnEnemy()
+	local originalModel = workspace:FindFirstChild("skibidi toilet")
+
+	if not originalModel then
+		warn("ОШИБКА: Модель 'skibidi toilet' не найдена!")
+		return
+	end
+	if not originalModel.PrimaryPart then
+		warn("ОШИБКА: У модели нет PrimaryPart!")
+		return
+	end
+
+	local enemy = originalModel:Clone()
+	enemy.Name = "Enemy"
+	enemy.Parent = workspace
+
+	enemy:MoveTo(Vector3.new(
+		waypoints[1].Position.X,
+		waypoints[1].Position.Y + CONFIG.spawnHeight,
+		waypoints[1].Position.Z
+		))
+
+	task.wait(0.1)
+	moveEnemy(enemy)
+end
+
+spawnEnemy()
