@@ -1,0 +1,462 @@
+local RunService = game:GetService("RunService")
+
+local Effects = require(script.Parent.Effects)
+
+local CONFIG = {
+	speed         = 15,
+	rotateSpeed   = 0.15,
+	spawnHeight   = 3,
+	waypointReach = 2,
+	baseReach     = 7,
+	spread        = 4,   -- разброс врагов от маршрута
+	maxHP         = 100,
+
+	-- Стан-враги (opts.stunner = true): периодически глушат ближайшую башню
+	stunRadius   = 14,
+	stunCooldown = 6,
+	stunDuration = 5,
+
+	-- Перевербованный союзник
+	allyMeleeRange    = 4,
+	allyCounterDamage = 8,  -- враг отбивается от союзника в ближнем бою
+	allyLifetime      = 30, -- сек жизни союзника, потом исчезает (баланс:
+	                        -- иначе турель-союзник бессмертна и стреляет вечно)
+}
+
+local ALLY_COLOR    = Color3.fromRGB(90, 230, 120)
+local STUNNER_COLOR = Color3.fromRGB(255, 220, 0)
+
+local EnemyClass = {}
+EnemyClass.__index = EnemyClass
+EnemyClass.CONFIG = CONFIG
+
+-- opts (необязательно):
+--   hpMult / speedMult — множители сложности волны
+--   stunner   — этот враг умеет глушить башни
+--   getTowers — список башен (нужен стан-врагам)
+function EnemyClass.new(model, waypoints, base, opts)
+	local rootPart = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+	if not rootPart then
+		warn("Враг '" .. model.Name .. "': нет PrimaryPart и ни одной BasePart — спавн отменён")
+		model:Destroy()
+		return nil
+	end
+
+	opts = opts or {}
+
+	local self = setmetatable({}, EnemyClass)
+	self.model     = model
+	self.rootPart  = rootPart
+	self.waypoints = waypoints
+	self.base      = base
+	self.maxHP     = math.floor(CONFIG.maxHP * (opts.hpMult or 1))
+	self.hp        = self.maxHP
+	self.speed     = CONFIG.speed * (opts.speedMult or 1)
+	self.hipHeight = CONFIG.spawnHeight
+	self.isAlive   = true
+	self.friendly  = false -- перевербован башней-вербовщиком
+	self.onDied    = nil -- колбэк: GameManager убирает врага из списка
+
+	-- Случайный разброс для каждого врага
+	self.offsetX = math.random(-CONFIG.spread, CONFIG.spread)
+	self.offsetZ = math.random(-CONFIG.spread, CONFIG.spread)
+
+	-- Параметры рейкаста прижатия к земле: игнорируем себя и базу
+	self.groundParams = RaycastParams.new()
+	self.groundParams.FilterType = Enum.RaycastFilterType.Exclude
+	self.groundParams.FilterDescendantsInstances = {model, base.model}
+
+	-- Humanoid из шаблона-рига не нужен: он вмешивается
+	-- в физику и позиционирование. Удаляем.
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid then humanoid:Destroy() end
+
+	-- Жёсткая сборка: rootPart — единственный якорь, все остальные
+	-- детали привариваются к нему. Двигаем ТОЛЬКО rootPart.CFrame,
+	-- поэтому визуал физически не может разъехаться с хитбоксом.
+	rootPart.Anchored   = true
+	rootPart.CanCollide = false
+	rootPart.CanQuery   = false -- курсор/рейкасты игнорируют врагов
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") and part ~= rootPart then
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0  = rootPart
+			weld.Part1  = part
+			weld.Parent = part
+			part.Anchored   = false
+			part.CanCollide = false
+			part.CanQuery   = false
+		end
+	end
+
+	self:createHPBar()
+
+	if opts.stunner then
+		self.isStunner = true
+		model:SetAttribute("Stunner", true)
+		self:createStunnerMark()
+		self:startStunLoop(opts.getTowers)
+	end
+
+	return self
+end
+
+-- Мгновенно ставит врага в точку (используется при спавне)
+function EnemyClass:teleportTo(position)
+	self.rootPart.CFrame = CFrame.new(position)
+end
+
+function EnemyClass:createHPBar()
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size        = UDim2.new(4, 0, 0.5, 0)
+	billboard.StudsOffset = Vector3.new(0, 5, 0)
+	billboard.AlwaysOnTop = false
+	billboard.Parent      = self.rootPart
+
+	local bg = Instance.new("Frame")
+	bg.Size             = UDim2.new(1, 0, 1, 0)
+	bg.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	bg.BorderSizePixel  = 0
+	bg.Parent           = billboard
+
+	local bar = Instance.new("Frame")
+	bar.Name            = "HPBar"
+	bar.Size            = UDim2.new(1, 0, 1, 0)
+	bar.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+	bar.BorderSizePixel = 0
+	bar.Parent          = bg
+
+	local label = Instance.new("TextLabel")
+	label.Size                   = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.TextColor3             = Color3.fromRGB(255, 255, 255)
+	label.TextScaled             = true
+	label.Text                   = self.maxHP .. " / " .. self.maxHP
+	label.Parent                 = bg
+
+	self.hpBar   = bar
+	self.hpLabel = label
+end
+
+-- Жёлтый шар над стан-врагом, чтобы его было видно издалека
+function EnemyClass:createStunnerMark()
+	local mark = Instance.new("Part")
+	mark.Shape      = Enum.PartType.Ball
+	mark.Size       = Vector3.new(1.2, 1.2, 1.2)
+	mark.Color      = STUNNER_COLOR
+	mark.Material   = Enum.Material.Neon
+	mark.CanCollide = false
+	mark.CanQuery   = false
+	mark.CastShadow = false
+	mark.Anchored   = false
+	mark.CFrame     = self.rootPart.CFrame * CFrame.new(0, 4, 0)
+	mark.Parent     = self.model
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0  = self.rootPart
+	weld.Part1  = mark
+	weld.Parent = mark
+end
+
+function EnemyClass:updateHPBar()
+	if not self.hpBar then return end
+	local pct = self.hp / self.maxHP
+	self.hpBar.Size = UDim2.new(pct, 0, 1, 0)
+	self.hpLabel.Text = math.floor(self.hp) .. " / " .. self.maxHP
+	if self.friendly then
+		self.hpBar.BackgroundColor3 = ALLY_COLOR
+	elseif pct > 0.5 then
+		self.hpBar.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+	elseif pct > 0.25 then
+		self.hpBar.BackgroundColor3 = Color3.fromRGB(255, 200, 0)
+	else
+		self.hpBar.BackgroundColor3 = Color3.fromRGB(255, 50, 50)
+	end
+end
+
+function EnemyClass:takeDamage(amount, damageColor)
+	if not self.isAlive then return end
+	self.hp = math.max(0, self.hp - amount)
+	self:updateHPBar()
+
+	-- всплывающая цифра урона (рисует клиент, цвет = тип оружия)
+	Effects.damageNumber(self.rootPart.Position + Vector3.new(0, 4, 0), amount, damageColor)
+
+	if self.hp <= 0 then
+		self.killedByDamage = true -- убит уроном, а не самоподрывом — даём награду
+		self:die()
+	end
+end
+
+function EnemyClass:die()
+	if not self.isAlive then return end
+	self.isAlive = false
+	if self.onDied then self.onDied() end
+	self.model:Destroy()
+end
+
+-- Камикадзе: дошёл до базы — один удар на свои ТЕКУЩИЕ HP и сразу умирает.
+-- Подраненный враг бьёт слабее — добивать врагов до базы выгодно.
+function EnemyClass:explode()
+	if not self.isAlive or self.friendly then return end
+	local damage = self.hp
+
+	Effects.sphere(self.rootPart.Position, Color3.fromRGB(255, 100, 0), 2, 12, 0.4)
+	self.base:takeDamage(damage)
+	self:die()
+end
+
+-- ============================================
+-- СТАН-ВРАГ: каждые stunCooldown сек глушит ближайшую башню
+-- ============================================
+
+function EnemyClass:startStunLoop(getTowers)
+	if not getTowers then return end
+	task.spawn(function()
+		while self.isAlive do
+			task.wait(CONFIG.stunCooldown)
+			if not self.isAlive or self.friendly then break end
+
+			local myPos = self.rootPart.Position
+			local nearest, nearestDist = nil, CONFIG.stunRadius
+			for _, tower in ipairs(getTowers()) do
+				if tower.rootPart and tower.health > 0 and not tower:isStunned() then
+					local dist = (tower.rootPart.Position - myPos).Magnitude
+					if dist <= nearestDist then
+						nearest, nearestDist = tower, dist
+					end
+				end
+			end
+
+			if nearest then
+				Effects.sphere(myPos, STUNNER_COLOR, 2, CONFIG.stunRadius * 2, 0.5)
+				Effects.beam(myPos + Vector3.new(0, 2, 0), nearest.rootPart.Position, STUNNER_COLOR, 0.4, 0.3)
+				nearest:stun(CONFIG.stunDuration)
+			end
+		end
+	end)
+end
+
+-- ============================================
+-- ПЕРЕВЕРБОВКА (башня-вербовщик)
+-- mode = "turret": союзник останавливается и стреляет по врагам как турель
+-- mode = "return": союзник разворачивается, догоняет врагов и дерётся врукопашную
+-- ============================================
+
+function EnemyClass:convert(mode, allyCfg, getEnemies)
+	if not self.isAlive or self.friendly then return end
+	allyCfg = allyCfg or {}
+
+	self.friendly     = true
+	self.haltMovement = true -- цикл движения по маршруту сам отключится
+	self.allyDamage   = allyCfg.damage or 12
+	self.allyFireRate = allyCfg.fireRate or 1
+	self.allyRange    = allyCfg.range or 18
+	self.model:SetAttribute("Friendly", true)
+
+	-- Перекраска в зелёный, чтобы союзника было видно
+	for _, part in ipairs(self.model:GetDescendants()) do
+		if part:IsA("BasePart") and part.Transparency < 1 then
+			part.Color = ALLY_COLOR
+		end
+	end
+	self:updateHPBar()
+	Effects.sphere(self.rootPart.Position, ALLY_COLOR, 2, 10, 0.5)
+
+	if mode == "return" then
+		self:startReturnAlly(getEnemies)
+	else
+		self:startTurretAlly(getEnemies)
+	end
+
+	-- Союзник не вечен: через allyLifetime сек уходит сам
+	task.delay(CONFIG.allyLifetime, function()
+		if self.isAlive and self.friendly then
+			Effects.sphere(self.rootPart.Position, ALLY_COLOR, 1, 8, 0.4)
+			self:die()
+		end
+	end)
+end
+
+-- Ближайший живой ВРАГ (не союзник, не сам)
+function EnemyClass:findNearestHostile(getEnemies, range)
+	if not getEnemies then return nil end
+	local myPos = self.rootPart.Position
+	local nearest, nearestDist = nil, range
+	for _, enemy in ipairs(getEnemies()) do
+		if enemy ~= self and enemy.isAlive and not enemy.friendly and enemy.rootPart then
+			local dist = (enemy.rootPart.Position - myPos).Magnitude
+			if dist <= nearestDist then
+				nearest, nearestDist = enemy, dist
+			end
+		end
+	end
+	return nearest
+end
+
+-- Режим «турель»: стоит на месте и стреляет по проходящим врагам
+function EnemyClass:startTurretAlly(getEnemies)
+	task.spawn(function()
+		while self.isAlive do
+			local target = self:findNearestHostile(getEnemies, self.allyRange)
+			if target then
+				target:takeDamage(self.allyDamage, ALLY_COLOR)
+				Effects.beam(
+					self.rootPart.Position + Vector3.new(0, 2, 0),
+					target.rootPart.Position, ALLY_COLOR, 0.25, 0.15
+				)
+			end
+			task.wait(1 / self.allyFireRate)
+		end
+	end)
+end
+
+-- Режим «возврат»: догоняет ближайшего врага и дерётся с ним —
+-- оба обмениваются ударами, пока один не умрёт
+function EnemyClass:startReturnAlly(getEnemies)
+	task.spawn(function()
+		while self.isAlive do
+			local target = self:findNearestHostile(getEnemies, math.huge)
+			if not target then
+				task.wait(0.5)
+				continue
+			end
+
+			while self.isAlive and target.isAlive do
+				local dt = task.wait()
+				local myPos = self.rootPart.Position
+				local targetPos = target.rootPart.Position
+				local flat = Vector3.new(targetPos.X - myPos.X, 0, targetPos.Z - myPos.Z)
+
+				if flat.Magnitude <= CONFIG.allyMeleeRange then
+					-- Рукопашная: союзник бьёт, враг отбивается
+					target:takeDamage(self.allyDamage, ALLY_COLOR)
+					Effects.sphere((myPos + targetPos) / 2, ALLY_COLOR, 1, 4, 0.25)
+					if self.isAlive then
+						self:takeDamage(CONFIG.allyCounterDamage, Color3.fromRGB(255, 80, 80))
+					end
+					task.wait(1)
+				else
+					-- Догоняем
+					local direction = flat.Unit
+					local newPos = myPos + direction * self.speed * dt
+
+					local groundY = self:findGroundY(newPos)
+					if groundY then
+						newPos = Vector3.new(newPos.X, groundY + self.hipHeight, newPos.Z)
+					end
+
+					local rootCF   = self.rootPart.CFrame
+					local targetCF = CFrame.new(myPos, Vector3.new(targetPos.X, myPos.Y, targetPos.Z))
+					local smoothCF = rootCF:Lerp(targetCF, CONFIG.rotateSpeed)
+					self.rootPart.CFrame = CFrame.new(newPos) * (smoothCF - smoothCF.Position)
+				end
+			end
+		end
+	end)
+end
+
+-- ============================================
+-- ДВИЖЕНИЕ ПО МАРШРУТУ
+-- ============================================
+
+-- Ищем землю под точкой (рельеф). На крыши башен не лезем.
+function EnemyClass:findGroundY(position)
+	local hit = workspace:Raycast(
+		position + Vector3.new(0, 10, 0),
+		Vector3.new(0, -60, 0),
+		self.groundParams
+	)
+	if not hit then return nil end
+
+	local inst = hit.Instance
+	while inst and inst ~= workspace do
+		if inst:IsA("Model") and inst:GetAttribute("TowerActive") then
+			return nil -- под нами башня — высоту не меняем
+		end
+		inst = inst.Parent
+	end
+	return hit.Position.Y
+end
+
+-- Плавное движение через Heartbeat с delta time
+function EnemyClass:moveTo(targetPos, reachDistance, callback)
+	local connection
+	connection = RunService.Heartbeat:Connect(function(dt)
+		if not self.isAlive or self.haltMovement then
+			connection:Disconnect()
+			return
+		end
+
+		-- Читаем и пишем позицию ТОЛЬКО через rootPart.CFrame.
+		-- Все детали модели приварены к rootPart, так что двигается
+		-- вся сборка целиком, без рассинхрона хитбокса и визуала.
+		local rootCF     = self.rootPart.CFrame
+		local currentPos = rootCF.Position
+		local flatTarget = Vector3.new(targetPos.X, currentPos.Y, targetPos.Z)
+		local dist = (currentPos - flatTarget).Magnitude
+
+		if dist <= reachDistance then
+			connection:Disconnect()
+			if callback then callback() end
+			return
+		end
+
+		local direction = (flatTarget - currentPos).Unit
+		local newPos    = currentPos + direction * self.speed * dt
+
+		-- Прижимаемся к земле (горки, рельеф)
+		local groundY = self:findGroundY(newPos)
+		if groundY then
+			newPos = Vector3.new(newPos.X, groundY + self.hipHeight, newPos.Z)
+		end
+
+		-- Плавный поворот
+		local targetCF = CFrame.new(currentPos, flatTarget)
+		local smoothCF = rootCF:Lerp(targetCF, CONFIG.rotateSpeed)
+
+		self.rootPart.CFrame =
+			CFrame.new(newPos) * (smoothCF - smoothCF.Position)
+	end)
+end
+
+function EnemyClass:move()
+	local index = 1
+
+	local function nextWaypoint()
+		if not self.isAlive or self.haltMovement then return end
+		if index > #self.waypoints then
+			self:goToBase()
+			return
+		end
+
+		local wp = self.waypoints[index]
+		index = index + 1
+
+		-- Добавляем случайный разброс к каждой точке
+		local target = Vector3.new(
+			wp.Position.X + self.offsetX,
+			wp.Position.Y,
+			wp.Position.Z + self.offsetZ
+		)
+
+		self:moveTo(target, CONFIG.waypointReach, nextWaypoint)
+	end
+
+	nextWaypoint()
+end
+
+function EnemyClass:goToBase()
+	if not self.isAlive or self.haltMovement then return end
+
+	local baseRoot = self.base.model:FindFirstChild("TowerBase")
+		or self.base.model:FindFirstChildWhichIsA("BasePart")
+	if not baseRoot then return end
+
+	-- Дошёл до базы — взрыв-камикадзе
+	self:moveTo(baseRoot.Position, CONFIG.baseReach, function()
+		self:explode()
+	end)
+end
+
+return EnemyClass
