@@ -1,4 +1,0 @@
-# This file lists tools managed by Rokit/Aftman, a toolchain manager for Roblox projects.
-
-[tools]
-rojo = "rojo-rbx/rojo@7.6.1"
